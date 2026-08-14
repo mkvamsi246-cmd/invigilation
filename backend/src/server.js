@@ -20,6 +20,7 @@ const app = express();
 app.use(cors({
     origin: process.env.FRONTEND_ORIGIN || true,
     credentials: true,
+    maxAge: 86400 // Cache preflight (OPTIONS) requests for 24 hours to speed up API calls
 }));
 app.use(express.json());
 
