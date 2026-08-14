@@ -1,4 +1,9 @@
-const API_BASE = '/api';
+// Dynamic API Base URL depending on environment
+// For local development, it defaults to '/api' (same-origin).
+// For Vercel deployment, replace the URL below with your deployed Render URL.
+const API_BASE = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
+    ? '/api'
+    : 'https://invigilation-backend.onrender.com/api'; // 👈 REPLACE with your Render URL (must end with /api)
 
 async function apiRequest(path, options = {}) {
     const res = await fetch(API_BASE + path, {

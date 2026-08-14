@@ -20,6 +20,11 @@ app.use(cors({
 }));
 app.use(express.json());
 
+const isProd = process.env.NODE_ENV === 'production';
+if (isProd) {
+    app.set('trust proxy', 1); // Trust first proxy (Render uses reverse proxies)
+}
+
 app.use(session({
     secret: process.env.SESSION_SECRET || 'dev-secret-change-me',
     resave: false,
@@ -27,7 +32,8 @@ app.use(session({
     cookie: {
         httpOnly: true,
         maxAge: 8 * 60 * 60 * 1000, // 8 hours
-        secure: process.env.NODE_ENV === 'production' && process.env.COOKIE_SECURE === 'true',
+        secure: isProd,
+        sameSite: isProd ? 'none' : 'lax',
     },
 }));
 
