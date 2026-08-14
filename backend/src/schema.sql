@@ -114,3 +114,12 @@ CREATE INDEX IF NOT EXISTS idx_duty_faculty ON invigilation_duty(faculty_id);
 CREATE INDEX IF NOT EXISTS idx_allocation_session ON exam_room_allocation(exam_session_id);
 CREATE INDEX IF NOT EXISTS idx_unavail_faculty_date ON faculty_unavailability(faculty_id, date);
 CREATE INDEX IF NOT EXISTS idx_timetable_faculty_day ON faculty_timetable(faculty_id, day_of_week);
+
+-- Session table for connect-pg-simple to store session data in production
+CREATE TABLE IF NOT EXISTS session (
+    sid         VARCHAR PRIMARY KEY NOT DEFERRABLE INITIALLY IMMEDIATE,
+    sess        JSONB NOT NULL,
+    expire      TIMESTAMP(6) NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_expire ON session (expire);

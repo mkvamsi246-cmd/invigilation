@@ -3,6 +3,9 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const session = require('express-session');
+const pgSession = require('connect-pg-simple')(session);
+const fs = require('fs');
+const db = require('./db');
 
 const authRoutes = require('./routes/auth');
 const facultyRoutes = require('./routes/faculty');
@@ -26,7 +29,11 @@ if (isProd) {
 }
 
 app.use(session({
-    secret: process.env.SESSION_SECRET || 'dev-secret-change-me',
+    store: new pgSession({
+        pool: db.pool, // Connection pool
+        tableName: 'session' // DB table name
+    }),
+    secret: process.env.SESSION_SECRET || 'dev-secret-change-key-2026',
     resave: false,
     saveUninitialized: false,
     cookie: {
@@ -68,6 +75,22 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => {
-    console.log(`Invigilation system running on http://localhost:${PORT}`);
-});
+
+// Run database migrations on startup, then start the server
+async function startServer() {
+    try {
+        const schemaPath = path.join(__dirname, 'schema.sql');
+        const sql = fs.readFileSync(schemaPath, 'utf8');
+        await db.query(sql);
+        console.log('✔ Database schema verified/applied successfully.');
+
+        app.listen(PORT, () => {
+            console.log(`Invigilation system running on http://localhost:${PORT}`);
+        });
+    } catch (err) {
+        console.error('✘ Failed to apply database schema on startup:', err);
+        process.exit(1);
+    }
+}
+
+startServer();
