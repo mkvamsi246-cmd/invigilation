@@ -45,6 +45,9 @@ app.use(session({
     },
 }));
 
+// Health check endpoint for server warm-up
+app.get('/api/health', (req, res) => res.json({ status: 'ok', timestamp: Date.now() }));
+
 // API routes
 app.use('/api/auth', authRoutes);
 app.use('/api/faculty', facultyRoutes);
@@ -56,11 +59,12 @@ app.use('/api/templates', templateRoutes);
 
 // Serve the frontend (single static folder, deployed alongside backend)
 const frontendPath = path.join(__dirname, '..', '..', 'frontend');
-// Disable caching for JS/CSS so browsers always fetch the latest code
+// Set efficient caching headers for static JS/CSS
 app.use(express.static(frontendPath, {
+    maxAge: '1h',
     setHeaders: (res, filePath) => {
         if (filePath.endsWith('.js') || filePath.endsWith('.css')) {
-            res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+            res.setHeader('Cache-Control', 'public, max-age=3600, must-revalidate');
         }
     }
 }));
@@ -77,19 +81,26 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 4000;
 
-// Run database migrations on startup, then start the server
+// Run database migrations on startup if not already initialized
 async function startServer() {
     try {
-        const schemaPath = path.join(__dirname, 'schema.sql');
-        const sql = fs.readFileSync(schemaPath, 'utf8');
-        await db.query(sql);
-        console.log('✔ Database schema verified/applied successfully.');
+        const tableCheck = await db.query(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'faculty')"
+        );
+        if (!tableCheck.rows[0].exists) {
+            const schemaPath = path.join(__dirname, 'schema.sql');
+            const sql = fs.readFileSync(schemaPath, 'utf8');
+            await db.query(sql);
+            console.log('✔ Database schema applied successfully.');
+        } else {
+            console.log('✔ Database schema verified (tables exist).');
+        }
 
         app.listen(PORT, () => {
             console.log(`Invigilation system running on http://localhost:${PORT}`);
         });
     } catch (err) {
-        console.error('✘ Failed to apply database schema on startup:', err);
+        console.error('✘ Failed to initialize database on startup:', err);
         process.exit(1);
     }
 }

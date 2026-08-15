@@ -3,18 +3,24 @@ require('dotenv').config();
 
 const isProd = process.env.NODE_ENV === 'production';
 
-const poolConfig = process.env.DATABASE_URL
-    ? {
-        connectionString: process.env.DATABASE_URL,
-        ssl: isProd ? { rejectUnauthorized: false } : false,
-      }
-    : {
-        host: process.env.PGHOST,
-        port: process.env.PGPORT,
-        database: process.env.PGDATABASE,
-        user: process.env.PGUSER,
-        password: process.env.PGPASSWORD,
-      };
+const poolConfig = {
+    ...(process.env.DATABASE_URL
+        ? {
+            connectionString: process.env.DATABASE_URL,
+            ssl: isProd ? { rejectUnauthorized: false } : false,
+          }
+        : {
+            host: process.env.PGHOST,
+            port: process.env.PGPORT,
+            database: process.env.PGDATABASE,
+            user: process.env.PGUSER,
+            password: process.env.PGPASSWORD,
+          }),
+    max: 10,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 5000,
+    keepAlive: true,
+};
 
 const pool = new Pool(poolConfig);
 

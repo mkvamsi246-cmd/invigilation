@@ -27,10 +27,19 @@ async function navigateTo(viewName) {
     document.getElementById('view-title').textContent = view.title;
 
     const container = document.getElementById('view-container');
-    container.innerHTML = '<p class="empty-state">Loading…</p>';
+    
+    // Only show loading placeholder if container is empty or if render takes time
+    let isInstant = true;
+    const loadingTimer = setTimeout(() => {
+        isInstant = false;
+        container.innerHTML = '<p class="empty-state">Loading…</p>';
+    }, 50);
+
     try {
         await view.render(container);
+        clearTimeout(loadingTimer);
     } catch (err) {
+        clearTimeout(loadingTimer);
         container.innerHTML = `<p class="error-text">${escapeHtml(err.message)}</p>`;
     }
 }
@@ -49,17 +58,43 @@ function formatDesignation(d) {
 // ---------- Init ----------
 
 document.addEventListener('DOMContentLoaded', () => {
-    document.getElementById('login-form').addEventListener('submit', async (e) => {
+    // 1. Fire non-blocking health ping to warm up backend (if sleeping on free tier)
+    api.get('/health').catch(() => {});
+
+    const loginForm = document.getElementById('login-form');
+    const submitBtn = document.getElementById('login-submit-btn');
+    const statusEl  = document.getElementById('login-status');
+    const errEl     = document.getElementById('login-error');
+
+    loginForm.addEventListener('submit', async (e) => {
         e.preventDefault();
         const username = document.getElementById('login-username').value.trim();
         const password = document.getElementById('login-password').value;
-        const errEl = document.getElementById('login-error');
         errEl.textContent = '';
+        if (statusEl) { statusEl.textContent = ''; statusEl.classList.add('hidden'); }
+
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'Signing in…';
+
+        // Timer to notify user if free-tier server is warming up
+        const warmUpTimer = setTimeout(() => {
+            if (statusEl) {
+                statusEl.textContent = '⚡ Waking up backend server from free-tier sleep mode (takes ~15-30s)...';
+                statusEl.classList.remove('hidden');
+            }
+        }, 1200);
+
         try {
             await api.post('/auth/login', { username, password });
+            clearTimeout(warmUpTimer);
             showApp(true);
         } catch (err) {
+            clearTimeout(warmUpTimer);
             errEl.textContent = err.message;
+        } finally {
+            submitBtn.disabled = false;
+            submitBtn.textContent = 'Sign In';
+            if (statusEl) statusEl.classList.add('hidden');
         }
     });
 
@@ -72,6 +107,7 @@ document.addEventListener('DOMContentLoaded', () => {
         btn.addEventListener('click', () => navigateTo(btn.dataset.view));
     });
 
+    // Check auth status
     api.get('/auth/status')
         .then((res) => showApp(res.authenticated))
         .catch(() => showApp(false));
