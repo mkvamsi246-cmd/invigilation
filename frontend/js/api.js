@@ -1,9 +1,8 @@
-// Dynamic API Base URL depending on environment
-// For local development, it defaults to '/api' (same-origin).
-// For Vercel deployment, replace the URL below with your deployed Render URL.
-const API_BASE = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
-    ? '/api'
-    : 'https://invigilation-backend.onrender.com/api'; // 👈 REPLACE with your Render URL (must end with /api)
+// Dynamic API Base URL — routes frontend static server (e.g. port 3001) to Express backend on port 4000
+const isLocal = ['localhost', '127.0.0.1'].includes(window.location.hostname) || /^192\.168\./.test(window.location.hostname) || /^10\./.test(window.location.hostname);
+const API_BASE = (isLocal && window.location.port !== '4000')
+    ? `${window.location.protocol}//${window.location.hostname}:4000/api`
+    : '/api';
 
 // In-memory response cache for GET requests to eliminate latency on tab switching
 const apiCache = new Map();
@@ -13,18 +12,24 @@ function clearApiCache() {
     apiCache.clear();
 }
 
+function getCleanPath(path) {
+    if (!path) return '';
+    return path.startsWith('/api/') ? path.slice(4) : path;
+}
+
 async function apiRequest(path, options = {}) {
+    const cleanPath = getCleanPath(path);
     const isGet = !options.method || options.method === 'GET';
     const bypassCache = options.bypassCache || false;
 
-    if (isGet && !bypassCache && apiCache.has(path)) {
-        const cached = apiCache.get(path);
+    if (isGet && !bypassCache && apiCache.has(cleanPath)) {
+        const cached = apiCache.get(cleanPath);
         if (Date.now() - cached.timestamp < DEFAULT_CACHE_TTL) {
             return cached.data;
         }
     }
 
-    const res = await fetch(API_BASE + path, {
+    const res = await fetch(API_BASE + cleanPath, {
         credentials: 'include',
         headers: options.body instanceof FormData ? {} : { 'Content-Type': 'application/json' },
         ...options,
@@ -44,13 +49,39 @@ async function apiRequest(path, options = {}) {
     }
 
     if (isGet && !bypassCache) {
-        apiCache.set(path, { data, timestamp: Date.now() });
+        apiCache.set(cleanPath, { data, timestamp: Date.now() });
     } else if (!isGet) {
-        // Clear cache on write operations (POST, PUT, PATCH, DELETE) so state stays fresh
         clearApiCache();
     }
 
     return data;
+}
+
+async function downloadFile(path, filename) {
+    const cleanPath = getCleanPath(path);
+    const res = await fetch(API_BASE + cleanPath, { credentials: 'include' });
+    if (res.status === 401) {
+        clearApiCache();
+        showApp(false);
+        throw new Error('Session expired. Please log in again.');
+    }
+    if (!res.ok) {
+        let errMsg = `Download failed (${res.status})`;
+        try {
+            const data = await res.json();
+            if (data && data.error) errMsg = data.error;
+        } catch (e) {}
+        throw new Error(errMsg);
+    }
+    const blob = await res.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename || 'download.xlsx';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.URL.revokeObjectURL(url);
 }
 
 const api = {
@@ -60,6 +91,7 @@ const api = {
     patch:      (path, body) => apiRequest(path, { method: 'PATCH',  body: JSON.stringify(body) }),
     del:        (path)       => apiRequest(path, { method: 'DELETE' }),
     upload:     (path, formData) => apiRequest(path, { method: 'POST', body: formData }),
+    download:   downloadFile,
     clearCache: clearApiCache,
     getCached:  (path)       => apiCache.has(path) ? apiCache.get(path).data : null,
 };

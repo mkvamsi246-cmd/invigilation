@@ -1,18 +1,54 @@
 async function renderExams(container) {
-    const exams = await api.get('/exams');
+    const groups = await api.get('/exams/grouped');
 
     container.innerHTML = `
         <div class="panel">
-            <h3 class="panel-title">Add Exam Session</h3>
+            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:12px;">
+                <h3 class="panel-title" style="margin:0;">Add Exam Session</h3>
+                <div style="display:flex;align-items:center;gap:8px;">
+                    <a href="/api/templates/exam_sessions" download class="btn btn-sm" style="font-size:12px;">Download Sample Excel</a>
+                    <label class="btn btn-sm btn-primary" style="margin:0;cursor:pointer;font-size:12px;background:var(--primary-color);">
+                        📁 Import Excel
+                        <input type="file" id="exam-import-input" accept=".xlsx,.xls" style="display:none;">
+                    </label>
+                </div>
+            </div>
             <form id="exam-form" class="row">
-                <div class="field"><label class="field-label">Exam Name</label><input class="input" name="exam_name" required placeholder="e.g. Mid-1 DBMS"></div>
+                <div class="field">
+                    <label class="field-label">Exam Name</label>
+                    <select class="input" name="exam_name" required>
+                        <option value="MID-1">MID-1</option>
+                        <option value="Mid-2">Mid-2</option>
+                        <option value="Sem-1">Sem-1</option>
+                        <option value="Sem-2">Sem-2</option>
+                    </select>
+                </div>
                 <div class="field"><label class="field-label">Date</label><input class="input" name="exam_date" type="date" required></div>
                 <div class="field">
                     <label class="field-label">Session</label>
-                    <select class="input" name="session">
-                        <option value="FN">Forenoon (FN)</option>
-                        <option value="AN">Afternoon (AN)</option>
+                    <select class="input" name="session" id="session-select-form">
+                        <option value="BOTH">Both (FN &amp; AN)</option>
+                        <option value="FN">Forenoon only (FN)</option>
+                        <option value="AN">Afternoon only (AN)</option>
                     </select>
+                </div>
+                <div class="field" style="max-width:110px;">
+                    <label class="field-label">Year / Sem <span style="font-size:10px;color:#dc2626;">*</span></label>
+                    <select class="input" name="year_sem" required>
+                        <option value="">- select -</option>
+                        <option value="1-1">1-1</option>
+                        <option value="1-2">1-2</option>
+                        <option value="2-1">2-1</option>
+                        <option value="2-2">2-2</option>
+                        <option value="3-1">3-1</option>
+                        <option value="3-2">3-2</option>
+                        <option value="4-1">4-1</option>
+                        <option value="4-2">4-2</option>
+                    </select>
+                </div>
+                <div class="field" style="max-width:130px;">
+                    <label class="field-label">Invigilators <span style="font-size:10px;color:var(--gray-500);">(optional)</span></label>
+                    <input class="input" name="required_invigilators" type="number" min="1" placeholder="e.g. 20">
                 </div>
                 <div class="field" style="max-width:130px;">
                     <label class="field-label">Start Time <span style="font-size:10px;color:var(--gray-500);">(optional)</span></label>
@@ -27,57 +63,116 @@ async function renderExams(container) {
         </div>
 
         <div class="panel">
-            <h3 class="panel-title">Exam Sessions (${exams.length})</h3>
-            ${exams.length === 0 ? '<p class="empty-state">No exam sessions yet.</p>' : `
+            <h3 class="panel-title">Exam Sessions (${groups.length})</h3>
+            ${groups.length === 0 ? '<p class="empty-state">No exam sessions yet.</p>' : `
             <div class="table-wrap">
                 <table>
-                    <thead><tr><th>Exam</th><th>Date</th><th>Session</th><th>Time</th><th></th></tr></thead>
+                    <thead>
+                        <tr>
+                            <th>Exam</th>
+                            <th>Date</th>
+                            <th>Session</th>
+                            <th>Year/Sem</th>
+                            <th>Invigilators</th>
+                            <th>Time</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
                     <tbody>
-                        ${exams.map((e) => `
+                        ${groups.map((g) => {
+                            const sessNames = g.sessions.map(s => s.session);
+                            const sessionText = (sessNames.includes('FN') && sessNames.includes('AN'))
+                                ? 'FN & AN'
+                                : sessNames.join(' & ');
+                            const idsStr = g.sessions.map(s => s.id).join(',');
+                            const firstSess = g.sessions[0] || {};
+                            return `
                             <tr>
-                                <td>${escapeHtml(e.exam_name)}</td>
-                                <td>${escapeHtml(String(e.exam_date).slice(0,10))}</td>
-                                <td>${escapeHtml(e.session)}</td>
+                                <td>${escapeHtml(g.examName)}</td>
+                                <td>${escapeHtml(String(g.examDate).slice(0,10))}</td>
+                                <td><span style="font-weight:600;">${escapeHtml(sessionText)}</span></td>
+                                <td>
+                                    ${g.yearSem
+                                        ? `<span style="background:#e0e7ff;color:#3730a3;font-size:11px;font-weight:700;padding:2px 8px;border-radius:10px;">${escapeHtml(g.yearSem)}</span>`
+                                        : '<span style="color:var(--gray-400);font-size:11px;">-</span>'}
+                                </td>
+                                <td style="text-align:center;font-size:13px;">
+                                    ${firstSess.requiredInvigilators != null
+                                        ? `<span style="font-weight:600;">${firstSess.requiredInvigilators}</span> <span style="color:var(--gray-500);font-size:11px;">(manual)</span>`
+                                        : '<span style="color:var(--gray-400);font-size:11px;">auto</span>'}
+                                </td>
                                 <td style="font-size:12px;color:var(--gray-500);">
-                                    ${e.start_time ? `${e.start_time}` : '—'}
-                                    ${e.start_time && e.end_time ? ' → ' : ''}
-                                    ${e.end_time ? `${e.end_time}` : ''}
+                                    ${firstSess.startTime ? `${firstSess.startTime}` : '-'}
+                                    ${firstSess.startTime && firstSess.endTime ? ' &rarr; ' : ''}
+                                    ${firstSess.endTime ? `${firstSess.endTime}` : ''}
                                 </td>
                                 <td>
-                                    <button class="btn btn-sm" data-manage-rooms="${e.id}">Manage Rooms</button>
-                                    <button class="btn btn-sm btn-danger" data-delete-exam="${e.id}">Delete</button>
+                                    <button class="btn btn-sm btn-danger" data-delete-ids="${idsStr}">Delete</button>
                                 </td>
                             </tr>
-                        `).join('')}
+                        `;}).join('')}
                     </tbody>
                 </table>
             </div>`}
         </div>
-
-        <div id="room-panel"></div>
     `;
 
     document.getElementById('exam-form').addEventListener('submit', async (e) => {
         e.preventDefault();
         const fd = new FormData(e.target);
         const data = Object.fromEntries(fd);
-        // Remove empty optional time fields so the backend doesn't receive empty strings
         if (!data.start_time) delete data.start_time;
         if (!data.end_time)   delete data.end_time;
+
+        const selectedSession = data.session;
+        const sessionsToCreate = selectedSession === 'BOTH'
+            ? ['FN', 'AN']
+            : [selectedSession];
+
+        const btn = document.querySelector('#exam-form button[type="submit"]');
+        btn.disabled = true;
+        btn.textContent = 'Adding...';
+
         try {
-            await api.post('/exams', data);
-            showToast('Exam session added');
+            for (const sess of sessionsToCreate) {
+                await api.post('/exams', { ...data, session: sess });
+            }
+            showToast(
+                sessionsToCreate.length === 2
+                    ? 'Both FN & AN sessions added'
+                    : 'Exam session added'
+            );
+            renderExams(container);
+        } catch (err) {
+            showToast(err.message, true);
+            btn.disabled = false;
+            btn.textContent = 'Add';
+        }
+    });
+
+    document.getElementById('exam-import-input').addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const fd = new FormData();
+        fd.append('file', file);
+        try {
+            showToast('Uploading and importing exam sessions...');
+            const res = await api.upload('/upload/exam_sessions', fd);
+            showToast(`Imported ${res.imported} exam session(s)!`);
             renderExams(container);
         } catch (err) {
             showToast(err.message, true);
         }
     });
 
-    container.querySelectorAll('[data-delete-exam]').forEach((btn) => {
+    container.querySelectorAll('[data-delete-ids]').forEach((btn) => {
         btn.addEventListener('click', async () => {
-            if (!confirm('Delete this exam session and all its room/duty data?')) return;
+            if (!confirm('Delete this exam session and all its duty data?')) return;
             try {
-                await api.del(`/exams/${btn.dataset.deleteExam}`);
+                const ids = btn.dataset.deleteIds.split(',');
+                for (const id of ids) {
+                    await api.del(`/exams/${id}`);
+                }
                 showToast('Exam session deleted');
                 renderExams(container);
             } catch (err) {
@@ -85,92 +180,4 @@ async function renderExams(container) {
             }
         });
     });
-
-    container.querySelectorAll('[data-manage-rooms]').forEach((btn) => {
-        btn.addEventListener('click', () => renderRoomPanel(btn.dataset.manageRooms));
-    });
-
-    async function renderRoomPanel(examSessionId) {
-        const panel = document.getElementById('room-panel');
-        panel.innerHTML = '<p class="empty-state">Loading rooms…</p>';
-        const [rooms, classrooms] = await Promise.all([
-            api.get(`/exams/${examSessionId}/rooms`),
-            api.get('/classrooms'),
-        ]);
-
-        panel.innerHTML = `
-            <div class="panel">
-                <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px;">
-                    <h3 class="panel-title" style="margin:0;">Rooms for this Exam Session</h3>
-                    <a href="/api/templates/exam_rooms"
-                       download
-                       class="btn btn-sm"
-                       style="font-size:12px;padding:4px 12px;"
-                       title="Download a sample Excel file for bulk room allocation upload">
-                        📥 Download Sample (Bulk Upload)
-                    </a>
-                </div>
-                <p style="font-size:12px;color:var(--gray-500);margin:-6px 0 12px;">
-                    Faculty required is automatically computed as <strong>ceil(Students ÷ 24)</strong>. Add rooms one-by-one below, or bulk-upload via <em>Import Data → Exam Room Allocation</em>.
-                </p>
-                <form id="room-alloc-form" class="row">
-                    <div class="field">
-                        <label class="field-label">Classroom</label>
-                        <select class="input" name="classroom_id" required>
-                            ${classrooms.length === 0
-                                ? '<option value="">— No classrooms yet —</option>'
-                                : classrooms.map((c) => `<option value="${c.id}">${escapeHtml(c.room_no)} (cap ${c.capacity})</option>`).join('')}
-                        </select>
-                    </div>
-                    <div class="field"><label class="field-label">Students Sitting</label><input class="input" name="students_count" type="number" min="0" required></div>
-                    <button class="btn btn-primary" type="submit" ${classrooms.length === 0 ? 'disabled' : ''}>Add Room</button>
-                </form>
-
-                ${rooms.length === 0 ? '<p class="empty-state">No rooms allocated to this session yet.</p>' : `
-                <div class="table-wrap" style="margin-top:16px;">
-                    <table>
-                        <thead><tr><th>Room</th><th>Students</th><th>Faculty Required</th><th></th></tr></thead>
-                        <tbody>
-                            ${rooms.map((r) => `
-                                <tr>
-                                    <td>${escapeHtml(r.room_no)}</td>
-                                    <td>${r.students_count}</td>
-                                    <td>
-                                        ${r.faculty_required}
-                                        <small style="color:var(--gray-500);font-size:11px;">
-                                            (= ceil(${r.students_count} ÷ 24))
-                                        </small>
-                                    </td>
-                                    <td><button class="btn btn-sm btn-danger" data-delete-alloc="${r.id}">Remove</button></td>
-                                </tr>
-                            `).join('')}
-                        </tbody>
-                    </table>
-                </div>`}
-            </div>
-        `;
-
-        document.getElementById('room-alloc-form').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const fd = new FormData(e.target);
-            try {
-                await api.post(`/exams/${examSessionId}/rooms`, Object.fromEntries(fd));
-                showToast('Room added to session');
-                renderRoomPanel(examSessionId);
-            } catch (err) {
-                showToast(err.message, true);
-            }
-        });
-
-        panel.querySelectorAll('[data-delete-alloc]').forEach((b) => {
-            b.addEventListener('click', async () => {
-                try {
-                    await api.del(`/exams/rooms/${b.dataset.deleteAlloc}`);
-                    renderRoomPanel(examSessionId);
-                } catch (err) {
-                    showToast(err.message, true);
-                }
-            });
-        });
-    }
 }

@@ -1,19 +1,36 @@
 const views = {
     dashboard: { title: 'Dashboard', render: renderDashboard },
     faculty: { title: 'Faculty', render: renderFaculty },
-    classrooms: { title: 'Classrooms', render: renderClassrooms },
     exams: { title: 'Exam Sessions', render: renderExams },
     generate: { title: 'Generate Duties', render: renderGenerate },
+    dutysheet: { title: 'Duty Sheet Export', render: renderDutySheet },
     import: { title: 'Import Data', render: renderImport },
     settings: { title: 'Settings', render: renderSettings },
 };
 
 let currentView = 'dashboard';
 
-function showApp(loggedIn) {
+function formatDeptName(name) {
+    if (!name) return '';
+    return name.replace(/-srkr$/i, '').toUpperCase();
+}
+
+function showApp(loggedIn, username, resetToDashboard = false) {
     document.getElementById('login-screen').classList.toggle('hidden', loggedIn);
     document.getElementById('app-shell').classList.toggle('hidden', !loggedIn);
-    if (loggedIn) navigateTo(currentView);
+    if (loggedIn) {
+        if (username) {
+            window.currentUsername = username;
+            const deptDisplay = formatDeptName(username);
+            const badgeText = document.getElementById('user-dept-text');
+            if (badgeText) badgeText.textContent = `Welcome Sir, ${deptDisplay}`;
+        }
+        if (resetToDashboard) {
+            navigateTo('dashboard');
+        } else {
+            navigateTo(currentView);
+        }
+    }
 }
 
 async function navigateTo(viewName) {
@@ -58,8 +75,20 @@ function formatDesignation(d) {
 // ---------- Init ----------
 
 document.addEventListener('DOMContentLoaded', () => {
-    // 1. Fire non-blocking health ping to warm up backend (if sleeping on free tier)
-    api.get('/health').catch(() => {});
+    // Password view toggle handler
+    const passwordInput = document.getElementById('login-password');
+    const togglePasswordBtn = document.getElementById('toggle-password-btn');
+    const eyeIcon = document.getElementById('eye-icon');
+
+    if (togglePasswordBtn && passwordInput) {
+        togglePasswordBtn.addEventListener('click', () => {
+            const isPassword = passwordInput.type === 'password';
+            passwordInput.type = isPassword ? 'text' : 'password';
+            eyeIcon.innerHTML = isPassword
+                ? `<path d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858-5.908a10.04 10.04 0 013.122-.463c4.478 0 8.268 2.943 9.542 7a10.025 10.025 0 01-4.132 5.411m-2.585-2.585a3 3 0 11-4.243-4.243"/><path d="M3 3l18 18"/>`
+                : `<path d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/>`;
+        });
+    }
 
     const loginForm = document.getElementById('login-form');
     const submitBtn = document.getElementById('login-submit-btn');
@@ -85,9 +114,9 @@ document.addEventListener('DOMContentLoaded', () => {
         }, 1200);
 
         try {
-            await api.post('/auth/login', { username, password });
+            const res = await api.post('/auth/login', { username, password });
             clearTimeout(warmUpTimer);
-            showApp(true);
+            showApp(true, res.username || username, true);
         } catch (err) {
             clearTimeout(warmUpTimer);
             errEl.textContent = err.message;
@@ -103,12 +132,35 @@ document.addEventListener('DOMContentLoaded', () => {
         showApp(false);
     });
 
+    // Mobile Navigation Drawer Handlers
+    const sidebar = document.getElementById('app-sidebar');
+    const overlay = document.getElementById('sidebar-overlay');
+    const menuBtn = document.getElementById('mobile-menu-toggle');
+    const closeBtn = document.getElementById('mobile-sidebar-close');
+
+    function closeMobileSidebar() {
+        if (sidebar) sidebar.classList.remove('open');
+        if (overlay) overlay.classList.add('hidden');
+    }
+
+    function openMobileSidebar() {
+        if (sidebar) sidebar.classList.add('open');
+        if (overlay) overlay.classList.remove('hidden');
+    }
+
+    if (menuBtn) menuBtn.addEventListener('click', openMobileSidebar);
+    if (closeBtn) closeBtn.addEventListener('click', closeMobileSidebar);
+    if (overlay) overlay.addEventListener('click', closeMobileSidebar);
+
     document.querySelectorAll('.nav-item[data-view]').forEach((btn) => {
-        btn.addEventListener('click', () => navigateTo(btn.dataset.view));
+        btn.addEventListener('click', () => {
+            closeMobileSidebar();
+            navigateTo(btn.dataset.view);
+        });
     });
 
     // Check auth status
     api.get('/auth/status')
-        .then((res) => showApp(res.authenticated))
+        .then((res) => showApp(res.authenticated, res.username))
         .catch(() => showApp(false));
 });

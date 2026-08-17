@@ -1,5 +1,8 @@
-const { Pool } = require('pg');
+const { Pool, types } = require('pg');
 require('dotenv').config();
+
+// Parse DATE columns (oid 1082) as simple YYYY-MM-DD strings to avoid JS Date timezone shifting
+types.setTypeParser(1082, val => val);
 
 const isProd = process.env.NODE_ENV === 'production';
 

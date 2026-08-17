@@ -1,266 +1,303 @@
 /**
- * Allocation Engine
- * ------------------
- * For a given exam session (a specific date + session, e.g. "2026-11-10 FN"),
- * this assigns faculty to each room used in that session, such that:
+ * Allocation Engine — Session-Level (Room-Free) Mode
+ * ---------------------------------------------------
+ * Assigns invigilators to an exam session WITHOUT needing rooms to be
+ * pre-allocated. The coordinator simply enters how many faculty are
+ * needed and the engine picks them from the eligible pool.
  *
- *   1. Every room gets ceil(students_in_room / students_per_faculty) invigilators
- *      (students_per_faculty defaults to 24, configurable in `settings`).
- *   2. Faculty who are marked unavailable for that date/session are skipped.
- *   3. Faculty who already have a class or lab scheduled during the periods
- *      that this exam session overlaps (on the matching day of week, from
- *      their weekly timetable) are HARD-EXCLUDED — they physically can't be
- *      in two places at once. This is the main fix: duty allocation now
- *      respects each faculty member's actual class/lab load for that day.
- *   4. A faculty member is never assigned to two rooms in the same session.
- *   5. Selection order follows the configured designation priority
- *      (e.g. assistant professors picked before associate before professor).
- *      Within the same designation tier, faculty are ordered by:
- *        a) fewest total duty_count so far (fairness), then
- *        b) fewest OTHER classes/labs that same day (so faculty who are
- *           already busiest that day aren't also loaded with duty), then
- *        c) name, for a stable order.
- *   6. duty_count is incremented for everyone assigned, so the next
- *      generation run naturally continues to balance load.
+ * Eligibility rules (unchanged):
+ *  1. Faculty must be active and not marked unavailable for that date/session.
+ *  2. Faculty must have no class/lab during the session's timetable periods.
+ *  3. Faculty who teach a year still running normal classes on that day/session
+ *     are excluded with a distinct reason tag.
+ *
+ * Selection order:
+ *  - Eligible faculty sorted by serial_no DESC (highest S.No picked first;
+ *    NULL serial_no go last, sorted by name).
+ *  - Consecutive-day rule: faculty who had a duty on the immediately preceding
+ *    calendar day are pushed to the back of the pool (used only if no one else
+ *    is available).
+ *  Priority tiers and duty_count are no longer used for ordering.
  */
 
 const db = require('../db');
+const { extractYearSem, VALID_YEAR_SEMS } = require('../utils/yearSem');
 
 const DAY_ABBREVIATIONS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 async function getSettings() {
     const { rows } = await db.query('SELECT key, value FROM settings');
-    const settings = {};
-    for (const row of rows) settings[row.key] = row.value;
+    const s = {};
+    for (const r of rows) s[r.key] = r.value;
     return {
-        priorityOrder: settings.priority_order || ['assistant_professor', 'associate_professor', 'professor'],
-        studentsPerFaculty: Number(settings.students_per_faculty) || 24,
-        sessionPeriods: settings.session_periods || { FN: [1, 2, 3, 4], AN: [5, 6, 7, 8] },
+        priorityOrder: s.priority_order || ['assistant_professor', 'associate_professor', 'professor'],
+        studentsPerFaculty: Number(s.students_per_faculty) || 24,
+        sessionPeriods:   s.session_periods   || { FN: [1, 2, 3, 4], AN: [5, 6, 7, 8] },
     };
 }
 
-/**
- * Recomputes faculty_required for every room in a session based on the
- * current students_per_faculty setting, then returns the room list.
- */
-async function getRoomsForSession(examSessionId, studentsPerFaculty) {
-    const { rows } = await db.query(
-        `SELECT era.id, era.classroom_id, era.students_count, c.room_no, c.capacity
-         FROM exam_room_allocation era
-         JOIN classrooms c ON c.id = era.classroom_id
-         WHERE era.exam_session_id = $1
-         ORDER BY c.room_no`,
-        [examSessionId]
-    );
-
-    const rooms = rows.map((r) => ({
-        allocationId: r.id,
-        classroomId: r.classroom_id,
-        roomNo: r.room_no,
-        studentsCount: r.students_count,
-        facultyRequired: Math.max(1, Math.ceil(r.students_count / studentsPerFaculty)),
-    }));
-
-    for (const room of rooms) {
-        await db.query(
-            `UPDATE exam_room_allocation SET faculty_required = $1 WHERE id = $2`,
-            [room.facultyRequired, room.allocationId]
-        );
-    }
-
-    return rooms;
-}
-
-/** JS Date.getDay() (0=Sun..6=Sat) -> the 3-letter day abbreviation used in faculty_timetable */
 function dayOfWeekAbbrev(dateStr) {
-    // The pg driver returns PostgreSQL DATE columns as local-midnight Date objects.
-    // Use getDay() (local time) — NOT getUTCDay() — because pg already adjusts to local.
-    if (dateStr instanceof Date) {
-        return DAY_ABBREVIATIONS[dateStr.getDay()];
-    }
-    // Fallback for plain 'YYYY-MM-DD' strings (e.g. from tests or imports)
-    const d = new Date(String(dateStr).slice(0, 10) + 'T00:00:00');
-    return DAY_ABBREVIATIONS[d.getDay()];
+    const s = dateStr instanceof Date
+        ? dateStr.toISOString().slice(0, 10)
+        : String(dateStr).slice(0, 10);
+    const [y, m, d] = s.split('-').map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    return DAY_ABBREVIATIONS[dt.getUTCDay()];
+}
+
+/** year_sems NOT sitting an exam on this date+session → those years are still teaching */
+async function getStillInClassYears(examDate, session) {
+    const { rows } = await db.query(
+        `SELECT DISTINCT year_sem FROM exam_sessions
+         WHERE exam_date = $1 AND session = $2 AND year_sem IS NOT NULL`,
+        [examDate, session]
+    );
+    const examYearSems = new Set(rows.map(r => r.year_sem));
+    return VALID_YEAR_SEMS.filter(ys => !examYearSems.has(ys));
 }
 
 /**
- * Returns eligible faculty for a date+session, already filtered for:
- *   - active status
- *   - manual unavailability entries
- *   - timetable conflicts (class/lab scheduled during the session's periods)
- * and annotated with `classesThatDay` (their total period count that weekday,
- * used as a secondary tiebreaker so lighter-day faculty are preferred).
+ * Returns faculty IDs that already have a session duty on the day immediately
+ * before examDate. These faculty are moved to the back of the pool so they
+ * are only used when no one else is available (consecutive-day rule).
  */
-async function getEligibleFacultyPool(examDate, session, priorityOrder, sessionPeriods) {
-    const dayAbbrev = dayOfWeekAbbrev(examDate);
+async function getPrevDayAssignedIds(examDate) {
+    const s = examDate instanceof Date
+        ? examDate.toISOString().slice(0, 10)
+        : String(examDate).slice(0, 10);
+    const [y, m, d] = s.split('-').map(Number);
+    const prevDt = new Date(Date.UTC(y, m - 1, d - 1));
+    const prevDateStr = prevDt.toISOString().slice(0, 10);
+    const { rows } = await db.query(
+        `SELECT DISTINCT sd.faculty_id
+         FROM session_duty sd
+         JOIN exam_sessions es ON es.id = sd.exam_session_id
+         WHERE es.exam_date = $1`,
+        [prevDateStr]
+    );
+    return new Set(rows.map(r => r.faculty_id));
+}
+
+/**
+ * Returns the eligible faculty pool for a date+session, ordered for selection.
+ *
+ * Filtering layers:
+ *   1. SQL: inactive / unavailable / direct timetable conflict
+ *   2. JS:  "still-in-class year" conflict
+ *
+ * Ordering:
+ *   - Primary: serial_no DESC NULLS LAST (highest S.No picked first)
+ *   - Tiebreak: name ASC
+ *   - Consecutive-day rule: faculty who had a duty yesterday are appended
+ *     after the rest, only used when no other eligible person is available.
+ */
+async function getEligibleFacultyPool(examDate, session, sessionPeriods) {
+    const dayAbbrev       = dayOfWeekAbbrev(examDate);
     const relevantPeriods = sessionPeriods[session] || [];
 
     const { rows } = await db.query(
-        `SELECT f.id, f.name, f.designation, f.duty_count, f.priority,
-                COALESCE(day_load.total_periods, 0) AS classes_that_day,
-                COALESCE(conflict.conflict_count, 0) AS conflict_count
+        `SELECT f.id, f.name, f.designation, f.duty_count, f.serial_no, f.shortcuts,
+                COALESCE(cf.conflict_count, 0) AS conflict_count
          FROM faculty f
-         LEFT JOIN (
-             SELECT faculty_id, COUNT(*) AS total_periods
-             FROM faculty_timetable
-             WHERE day_of_week = $1
-             GROUP BY faculty_id
-         ) day_load ON day_load.faculty_id = f.id
          LEFT JOIN (
              SELECT faculty_id, COUNT(*) AS conflict_count
              FROM faculty_timetable
-             WHERE day_of_week = $1 AND period = ANY($2::int[])
-             GROUP BY faculty_id
-         ) conflict ON conflict.faculty_id = f.id
+             WHERE day_of_week = $1 AND period = ANY($2::int[]) GROUP BY faculty_id
+         ) cf ON cf.faculty_id = f.id
          WHERE f.is_active = true
            AND f.id NOT IN (
-                SELECT faculty_id FROM faculty_unavailability
-                WHERE date = $3 AND (session = $4 OR session = 'ALL')
+               SELECT faculty_id FROM faculty_unavailability
+               WHERE date = $3 AND (session = $4 OR session = 'ALL')
            )
-         ORDER BY f.priority, f.name`,
+         ORDER BY f.serial_no DESC NULLS LAST, f.name`,
         [dayAbbrev, relevantPeriods, examDate, session]
     );
 
-    // Hard-exclude anyone with a class/lab in a period this exam session overlaps
-    const eligible = rows.filter((r) => Number(r.conflict_count) === 0);
+    // Layer 1: hard exclude — class during exam periods
+    const afterConflict = rows.filter(r => Number(r.conflict_count) === 0);
 
-    eligible.forEach((r) => {
-        r.classes_that_day = Number(r.classes_that_day);
-        r.priority = Number(r.priority);
-    });
+    // Layer 2: still-in-class year exclusion
+    const stillInClassYears = await getStillInClassYears(examDate, session);
+    let eligible = [];
 
-    // Sort: 1) faculty-level priority (lower = first), 2) designation tier, 3) duty count, 4) name
-    const tierIndex = (designation) => {
-        const idx = priorityOrder.indexOf(designation);
-        return idx === -1 ? priorityOrder.length : idx;
-    };
+    if (stillInClassYears.length === 0 || afterConflict.length === 0) {
+        eligible = afterConflict;
+    } else {
+        const ids = afterConflict.map(f => f.id);
+        const { rows: stillRows } = await db.query(
+            `SELECT DISTINCT faculty_id, year_sem FROM faculty_timetable
+             WHERE faculty_id = ANY($1::int[])
+               AND day_of_week = $2 AND period = ANY($3::int[])
+               AND year_sem = ANY($4::text[])`,
+            [ids, dayAbbrev, relevantPeriods, stillInClassYears]
+        );
+        const blocked = new Map();
+        for (const r of stillRows) {
+            if (!blocked.has(r.faculty_id)) blocked.set(r.faculty_id, r.year_sem);
+        }
+        for (const f of afterConflict) {
+            if (!blocked.has(f.id)) eligible.push(f);
+        }
+    }
 
-    eligible.sort((a, b) => {
-        if (a.priority !== b.priority) return a.priority - b.priority;
-        const tierDiff = tierIndex(a.designation) - tierIndex(b.designation);
-        if (tierDiff !== 0) return tierDiff;
-        if (a.duty_count !== b.duty_count) return a.duty_count - b.duty_count;
-        if (a.classes_that_day !== b.classes_that_day) return a.classes_that_day - b.classes_that_day;
-        return a.name.localeCompare(b.name);
-    });
+    // Layer 3: consecutive-day rule — push yesterday's invigilators to the back.
+    const prevDayIds = await getPrevDayAssignedIds(examDate);
+    if (prevDayIds.size > 0) {
+        const noPrevDuty  = eligible.filter(f => !prevDayIds.has(f.id));
+        const hadPrevDuty = eligible.filter(f =>  prevDayIds.has(f.id));
+        eligible = [...noPrevDuty, ...hadPrevDuty];
+    }
 
     return eligible;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SESSION-LEVEL (ROOM-FREE) DUTY GENERATION
+// ─────────────────────────────────────────────────────────────────────────────
+
 /**
- * Main entry point: generate (or regenerate) invigilation duties for an
- * exam session. Existing duties for this session are cleared first, so this
- * is safe to re-run after editing faculty/classroom/timetable data.
+ * Dry-run: returns which faculty would be assigned to each session,
+ * without writing anything to the database.
+ *
+ * @param {number[]} sessionIds   — one or two exam_session IDs (FN + AN)
+ * @param {number|null} overrideCount — per-session headcount override
  */
-async function generateDutiesForSession(examSessionId) {
+async function previewSessionDuties(sessionIds, overrideCount) {
+    const { sessionPeriods } = await getSettings();
+    const results = [];
+
+    // Track faculty IDs already assigned in an earlier session of this same call
+    // so the same person is never listed in both FN and AN.
+    const assignedAcrossSessions = new Set();
+
+    for (const examSessionId of sessionIds) {
+        const { rows: sr } = await db.query(
+            'SELECT * FROM exam_sessions WHERE id = $1', [examSessionId]
+        );
+        if (sr.length === 0) throw new Error(`Exam session ${examSessionId} not found`);
+        const sess = sr[0];
+
+        const pool = (await getEligibleFacultyPool(
+            sess.exam_date, sess.session, sessionPeriods
+        )).filter(f => !assignedAcrossSessions.has(f.id));   // ← exclude already-used faculty
+
+        const count = overrideCount
+            || (sess.required_invigilators ? parseInt(sess.required_invigilators, 10) : null)
+            || pool.length;   // default: show all eligible
+
+        const assigned = pool.slice(0, count);
+        assigned.forEach(f => assignedAcrossSessions.add(f.id));  // ← mark as used
+        const shortfall = Math.max(0, count - assigned.length);
+
+        results.push({
+            examSessionId,
+            session: sess.session,
+            examName: sess.exam_name,
+            examDate: String(sess.exam_date).slice(0, 10),
+            yearSem: sess.year_sem,
+            requestedCount: count,
+            assignees: assigned.map(f => ({
+                id:              f.id,
+                name:            f.name,
+                designation:     f.designation,
+                serialNo:        f.serial_no,
+                shortcuts:       f.shortcuts || '',
+                currentDutyCount: f.duty_count,
+            })),
+            shortfall,
+            totalEligible: pool.length,
+        });
+    }
+    return results;
+}
+
+/**
+ * Writes session-level duties to `session_duty`.
+ * Clears previous duties for the given sessions first (idempotent).
+ *
+ * @param {number[]} sessionIds
+ * @param {number|null} overrideCount
+ */
+async function generateSessionDuties(sessionIds, overrideCount) {
     const client = await db.getClient();
     try {
         await client.query('BEGIN');
 
-        const sessionRes = await client.query(
-            'SELECT * FROM exam_sessions WHERE id = $1',
-            [examSessionId]
-        );
-        if (sessionRes.rows.length === 0) {
-            throw new Error('Exam session not found');
-        }
-        const examSession = sessionRes.rows[0];
+        const { sessionPeriods } = await getSettings();
+        const results = [];
 
-        const { priorityOrder, studentsPerFaculty, sessionPeriods } = await getSettings();
-        const rooms = await getRoomsForSession(examSessionId, studentsPerFaculty);
+        // Track faculty IDs already assigned in an earlier session of this same call
+        // so the same person is never assigned to both FN and AN on the same day.
+        const assignedAcrossSessions = new Set();
 
-        if (rooms.length === 0) {
-            throw new Error('No rooms allocated to this exam session yet');
-        }
-
-        // Decrement duty_count for everyone currently assigned before wiping,
-        // so re-generation doesn't double-count (idempotent regeneration).
-        await client.query(
-            `UPDATE faculty SET duty_count = GREATEST(duty_count - 1, 0)
-             WHERE id IN (
-                 SELECT faculty_id FROM invigilation_duty
-                 WHERE exam_room_allocation_id IN (
-                     SELECT id FROM exam_room_allocation WHERE exam_session_id = $1
-                 )
-             )`,
-            [examSessionId]
-        );
-
-        // Now clear previous assignments for this session
-        await client.query(
-            `DELETE FROM invigilation_duty
-             WHERE exam_room_allocation_id IN (
-                 SELECT id FROM exam_room_allocation WHERE exam_session_id = $1
-             )`,
-            [examSessionId]
-        );
-
-        let pool = await getEligibleFacultyPool(
-            examSession.exam_date,
-            examSession.session,
-            priorityOrder,
-            sessionPeriods
-        );
-
-        const sortPool = (arr) => arr.slice().sort((a, b) => {
-            const tierDiff = priorityOrder.indexOf(a.designation) - priorityOrder.indexOf(b.designation);
-            if (tierDiff !== 0) return tierDiff;
-            if (a.duty_count !== b.duty_count) return a.duty_count - b.duty_count;
-            if (a.classes_that_day !== b.classes_that_day) return a.classes_that_day - b.classes_that_day;
-            return a.name.localeCompare(b.name);
-        });
-
-        const assignments = [];
-        const shortfalls = [];
-        const usedThisSession = new Set();
-
-        for (const room of rooms) {
-            const picked = [];
-            for (const candidate of pool) {
-                if (picked.length >= room.facultyRequired) break;
-                if (usedThisSession.has(candidate.id)) continue;
-                picked.push(candidate);
-                usedThisSession.add(candidate.id);
-            }
-
-            if (picked.length < room.facultyRequired) {
-                shortfalls.push({
-                    roomNo: room.roomNo,
-                    required: room.facultyRequired,
-                    assigned: picked.length,
-                    reason: 'Not enough faculty free of class/lab conflicts and unavailability for this slot',
-                });
-            }
-
-            for (const fac of picked) {
-                assignments.push({ allocationId: room.allocationId, facultyId: fac.id });
-                fac.duty_count += 1; // reflect locally so subsequent rooms keep balancing
-            }
-
-            pool = sortPool(pool);
-        }
-
-        for (const a of assignments) {
-            await client.query(
-                `INSERT INTO invigilation_duty (exam_room_allocation_id, faculty_id, status)
-                 VALUES ($1, $2, 'assigned')
-                 ON CONFLICT (exam_room_allocation_id, faculty_id) DO NOTHING`,
-                [a.allocationId, a.facultyId]
+        for (const examSessionId of sessionIds) {
+            const { rows: sr } = await client.query(
+                'SELECT * FROM exam_sessions WHERE id = $1', [examSessionId]
             );
-            await client.query(
-                `UPDATE faculty SET duty_count = duty_count + 1, updated_at = now() WHERE id = $1`,
-                [a.facultyId]
+            if (sr.length === 0) throw new Error(`Exam session ${examSessionId} not found`);
+            const sess = sr[0];
+
+            // Decrement duty_count for previously assigned faculty
+            const { rows: prev } = await client.query(
+                'SELECT faculty_id FROM session_duty WHERE exam_session_id = $1', [examSessionId]
             );
+            for (const p of prev) {
+                await client.query(
+                    'UPDATE faculty SET duty_count = GREATEST(duty_count - 1, 0) WHERE id = $1',
+                    [p.faculty_id]
+                );
+            }
+            await client.query(
+                'DELETE FROM session_duty WHERE exam_session_id = $1', [examSessionId]
+            );
+
+            // If overrideCount provided, persist it
+            if (overrideCount) {
+                await client.query(
+                    'UPDATE exam_sessions SET required_invigilators = $1 WHERE id = $2',
+                    [overrideCount, examSessionId]
+                );
+            }
+
+            const pool = (await getEligibleFacultyPool(
+                sess.exam_date, sess.session, sessionPeriods
+            )).filter(f => !assignedAcrossSessions.has(f.id));  // ← exclude already-used faculty
+
+            const count = overrideCount
+                || (sess.required_invigilators ? parseInt(sess.required_invigilators, 10) : null)
+                || pool.length;
+
+            const assigned = pool.slice(0, count);
+            assigned.forEach(f => assignedAcrossSessions.add(f.id));  // ← mark as used
+            const shortfall = Math.max(0, count - assigned.length);
+
+            for (const f of assigned) {
+                await client.query(
+                    `INSERT INTO session_duty (exam_session_id, faculty_id, status)
+                     VALUES ($1, $2, 'assigned')
+                     ON CONFLICT (exam_session_id, faculty_id) DO NOTHING`,
+                    [examSessionId, f.id]
+                );
+                await client.query(
+                    'UPDATE faculty SET duty_count = duty_count + 1, updated_at = now() WHERE id = $1',
+                    [f.id]
+                );
+            }
+
+            results.push({
+                examSessionId,
+                session: sess.session,
+                examName: sess.exam_name,
+                examDate: String(sess.exam_date).slice(0, 10),
+                yearSem: sess.year_sem,
+                totalAssigned: assigned.length,
+                requestedCount: count,
+                shortfall,
+            });
         }
 
         await client.query('COMMIT');
-
-        return {
-            examSessionId,
-            roomsProcessed: rooms.length,
-            totalAssigned: assignments.length,
-            shortfalls,
-        };
+        return results;
     } catch (err) {
         await client.query('ROLLBACK');
         throw err;
@@ -270,28 +307,106 @@ async function generateDutiesForSession(examSessionId) {
 }
 
 /**
- * Swap a single duty to a different faculty member manually
- * (used by the "modify" flow in the UI). Adjusts duty_count for both.
- * Does NOT block swaps onto a faculty member with a timetable conflict —
- * manual overrides are the invigilation coordinator's call — but the
- * conflict is surfaced by the caller via checkTimetableConflict below.
+ * Reads saved session duties for one or more sessions.
  */
-async function swapDuty(dutyId, newFacultyId) {
+async function getSessionDuties(sessionIds) {
+    const { rows } = await db.query(
+        `SELECT sd.id AS duty_id, sd.exam_session_id, sd.status,
+                es.session, es.exam_name, es.exam_date, es.year_sem,
+                f.id AS faculty_id, f.name AS faculty_name,
+                f.designation, f.serial_no, f.shortcuts, f.duty_count
+         FROM session_duty sd
+         JOIN exam_sessions es ON es.id = sd.exam_session_id
+         JOIN faculty f ON f.id = sd.faculty_id
+         WHERE sd.exam_session_id = ANY($1::int[])
+         ORDER BY es.session, f.serial_no ASC NULLS LAST, f.name`,
+        [sessionIds]
+    );
+    return rows;
+}
+
+/**
+ * Cancel a single session duty (frees the faculty member).
+ */
+async function cancelSessionDuty(dutyId) {
+    const { rows } = await db.query(
+        'SELECT faculty_id FROM session_duty WHERE id = $1', [dutyId]
+    );
+    if (rows.length === 0) throw new Error('Duty not found');
+    await db.query(
+        'UPDATE faculty SET duty_count = GREATEST(duty_count - 1, 0) WHERE id = $1',
+        [rows[0].faculty_id]
+    );
+    await db.query('DELETE FROM session_duty WHERE id = $1', [dutyId]);
+    return { success: true };
+}
+
+/**
+ * Returns eligible faculty for a session — used for the Reassign dropdown.
+ */
+async function getAvailableFacultyForSession(examSessionId) {
+    const { rows: sr } = await db.query(
+            'SELECT * FROM exam_sessions WHERE id = $1', [examSessionId]
+    );
+    if (sr.length === 0) throw new Error('Exam session not found');
+    const sess = sr[0];
+    const { sessionPeriods } = await getSettings();
+
+    // Get assigned faculty IDs for this exam session to exclude them
+    const { rows: assignedRows } = await db.query(
+        'SELECT faculty_id FROM session_duty WHERE exam_session_id = $1',
+        [examSessionId]
+    );
+    const assignedIds = new Set(assignedRows.map(r => r.faculty_id));
+
+    const pool = await getEligibleFacultyPool(
+        sess.exam_date, sess.session, sessionPeriods
+    );
+
+    // Filter out already-assigned faculty
+    const available = pool.filter(f => !assignedIds.has(f.id));
+
+    // Sort ascending by serial_no (S.No order), then by name
+    available.sort((a, b) => {
+        const sA = a.serial_no != null ? Number(a.serial_no) : 999999;
+        const sB = b.serial_no != null ? Number(b.serial_no) : 999999;
+        if (sA !== sB) return sA - sB;
+        return a.name.localeCompare(b.name);
+    });
+
+    return available.map(f => ({
+        id: f.id,
+        name: f.name,
+        designation: f.designation,
+        duty_count: f.duty_count,
+        serial_no: f.serial_no,
+        shortcuts: f.shortcuts || '',
+    }));
+}
+
+/**
+ * Manually swap a session duty to a different faculty member.
+ */
+async function swapSessionDuty(dutyId, newFacultyId) {
     const client = await db.getClient();
     try {
         await client.query('BEGIN');
-
-        const { rows } = await client.query('SELECT * FROM invigilation_duty WHERE id = $1', [dutyId]);
+        const { rows } = await client.query(
+            'SELECT * FROM session_duty WHERE id = $1', [dutyId]
+        );
         if (rows.length === 0) throw new Error('Duty not found');
         const duty = rows[0];
-
-        await client.query('UPDATE faculty SET duty_count = GREATEST(duty_count - 1, 0) WHERE id = $1', [duty.faculty_id]);
-        await client.query('UPDATE faculty SET duty_count = duty_count + 1 WHERE id = $1', [newFacultyId]);
         await client.query(
-            `UPDATE invigilation_duty SET faculty_id = $1, status = 'swapped' WHERE id = $2`,
+            'UPDATE faculty SET duty_count = GREATEST(duty_count - 1, 0) WHERE id = $1',
+            [duty.faculty_id]
+        );
+        await client.query(
+            'UPDATE faculty SET duty_count = duty_count + 1 WHERE id = $1', [newFacultyId]
+        );
+        await client.query(
+            `UPDATE session_duty SET faculty_id = $1, status = 'swapped' WHERE id = $2`,
             [newFacultyId, dutyId]
         );
-
         await client.query('COMMIT');
         return { success: true };
     } catch (err) {
@@ -302,152 +417,31 @@ async function swapDuty(dutyId, newFacultyId) {
     }
 }
 
-/**
- * Checks whether a specific faculty member has a class/lab conflict for a
- * given exam session — used by the frontend to warn the coordinator before
- * they manually reassign a duty to someone.
- */
+// Keep old room-based functions for backward-compat (existing saved duties still work)
 async function checkTimetableConflict(facultyId, examSessionId) {
-    const { rows: sessionRows } = await db.query('SELECT * FROM exam_sessions WHERE id = $1', [examSessionId]);
-    if (sessionRows.length === 0) throw new Error('Exam session not found');
-    const examSession = sessionRows[0];
-
+    const { rows: sr } = await db.query('SELECT * FROM exam_sessions WHERE id = $1', [examSessionId]);
+    if (sr.length === 0) throw new Error('Exam session not found');
+    const es = sr[0];
     const { sessionPeriods } = await getSettings();
-    const dayAbbrev = dayOfWeekAbbrev(examSession.exam_date);
-    const relevantPeriods = sessionPeriods[examSession.session] || [];
-
+    const dayAbbrev = dayOfWeekAbbrev(es.exam_date);
+    const periods   = sessionPeriods[es.session] || [];
     const { rows } = await db.query(
         `SELECT period, subject_code FROM faculty_timetable
          WHERE faculty_id = $1 AND day_of_week = $2 AND period = ANY($3::int[])`,
-        [facultyId, dayAbbrev, relevantPeriods]
+        [facultyId, dayAbbrev, periods]
     );
-
     return { hasConflict: rows.length > 0, conflicts: rows };
 }
 
-/**
- * DRY-RUN: runs the full allocation logic for an exam session but writes
- * NOTHING to the database. Returns the same assignment plan as
- * generateDutiesForSession so the coordinator can review before committing.
- */
-async function previewDutiesForSession(examSessionId) {
-    const sessionRes = await db.query('SELECT * FROM exam_sessions WHERE id = $1', [examSessionId]);
-    if (sessionRes.rows.length === 0) throw new Error('Exam session not found');
-    const examSession = sessionRes.rows[0];
-
-    const { priorityOrder, studentsPerFaculty, sessionPeriods } = await getSettings();
-
-    // Read rooms without updating faculty_required in the DB
-    const { rows: roomRows } = await db.query(
-        `SELECT era.id AS allocation_id, era.students_count, c.room_no
-         FROM exam_room_allocation era
-         JOIN classrooms c ON c.id = era.classroom_id
-         WHERE era.exam_session_id = $1 ORDER BY c.room_no`,
-        [examSessionId]
-    );
-    if (roomRows.length === 0) throw new Error('No rooms allocated to this exam session yet');
-
-    const rooms = roomRows.map((r) => ({
-        allocationId: r.allocation_id,
-        roomNo: r.room_no,
-        studentsCount: r.students_count,
-        facultyRequired: Math.max(1, Math.ceil(r.students_count / studentsPerFaculty)),
-    }));
-
-    let pool = await getEligibleFacultyPool(
-        examSession.exam_date,
-        examSession.session,
-        priorityOrder,
-        sessionPeriods
-    );
-
-    const sortPool = (arr) => arr.slice().sort((a, b) => {
-        const tierDiff = priorityOrder.indexOf(a.designation) - priorityOrder.indexOf(b.designation);
-        if (tierDiff !== 0) return tierDiff;
-        if (a.duty_count !== b.duty_count) return a.duty_count - b.duty_count;
-        if (a.classes_that_day !== b.classes_that_day) return a.classes_that_day - b.classes_that_day;
-        return a.name.localeCompare(b.name);
-    });
-
-    const previewRooms = [];
-    const shortfalls = [];
-    const usedThisSession = new Set();
-    let totalAssigned = 0;
-
-    for (const room of rooms) {
-        const picked = [];
-        for (const candidate of pool) {
-            if (picked.length >= room.facultyRequired) break;
-            if (usedThisSession.has(candidate.id)) continue;
-            picked.push(candidate);
-            usedThisSession.add(candidate.id);
-        }
-
-        if (picked.length < room.facultyRequired) {
-            shortfalls.push({
-                roomNo: room.roomNo,
-                required: room.facultyRequired,
-                assigned: picked.length,
-                reason: 'Not enough faculty free of conflicts and unavailability for this slot',
-            });
-        }
-
-        picked.forEach((f) => { f.duty_count += 1; });
-        pool = sortPool(pool);
-        totalAssigned += picked.length;
-
-        previewRooms.push({
-            roomNo: room.roomNo,
-            studentsCount: room.studentsCount,
-            facultyRequired: room.facultyRequired,
-            assignees: picked.map((f) => ({
-                id: f.id,
-                name: f.name,
-                designation: f.designation,
-                priority: f.priority,                // ← was missing; needed for priority badge in draft preview
-                currentDutyCount: f.duty_count - 1, // show count BEFORE this assignment
-            })),
-        });
-    }
-
-    return { examSessionId, rooms: previewRooms, shortfalls, totalAssigned };
-}
-
-/**
- * Returns the list of faculty eligible to invigilate a given exam session.
- * Filters out:
- *   - inactive faculty
- *   - faculty marked unavailable on that date/session
- *   - faculty with a class/lab timetable conflict during the session periods
- * Used to populate the Reassign dropdown in the frontend.
- */
-async function getAvailableFacultyForSession(examSessionId) {
-    const { rows: sessionRows } = await db.query('SELECT * FROM exam_sessions WHERE id = $1', [examSessionId]);
-    if (sessionRows.length === 0) throw new Error('Exam session not found');
-    const examSession = sessionRows[0];
-
-    const { priorityOrder, sessionPeriods } = await getSettings();
-    const eligible = await getEligibleFacultyPool(
-        examSession.exam_date,
-        examSession.session,
-        priorityOrder,
-        sessionPeriods
-    );
-
-    return eligible.map((f) => ({
-        id: f.id,
-        name: f.name,
-        designation: f.designation,
-        duty_count: f.duty_count,
-        priority: f.priority,
-    }));
-}
-
 module.exports = {
-    generateDutiesForSession,
-    previewDutiesForSession,
-    swapDuty,
     getSettings,
-    checkTimetableConflict,
+    // Session-level (new, room-free)
+    previewSessionDuties,
+    generateSessionDuties,
+    getSessionDuties,
+    cancelSessionDuty,
+    swapSessionDuty,
     getAvailableFacultyForSession,
+    checkTimetableConflict,
 };
+

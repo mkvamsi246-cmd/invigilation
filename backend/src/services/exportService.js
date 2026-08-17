@@ -1,4 +1,4 @@
-const ExcelJS = require('exceljs');
+﻿const ExcelJS = require('exceljs');
 const PDFDocument = require('pdfkit');
 const db = require('../db');
 
@@ -29,7 +29,7 @@ async function generateDutyChartExcel(examSessionId) {
     const sheet = workbook.addWorksheet('Duty Chart');
 
     sheet.mergeCells('A1:E1');
-    sheet.getCell('A1').value = `${session.exam_name} — ${session.exam_date} (${session.session})`;
+    sheet.getCell('A1').value = `${session.exam_name} â€” ${session.exam_date} (${session.session})`;
     sheet.getCell('A1').font = { bold: true, size: 14 };
 
     sheet.addRow([]);
@@ -45,7 +45,7 @@ async function generateDutyChartExcel(examSessionId) {
             r.room_no,
             r.students_count,
             r.faculty_required,
-            r.faculty_name || '— unassigned —',
+            r.faculty_name || 'â€” unassigned â€”',
             r.designation ? r.designation.replace('_', ' ') : '',
         ]);
     }
@@ -82,7 +82,7 @@ function generateDutyChartPdf(examSessionId) {
                 doc.text(String(r.room_no), colX[0], y);
                 doc.text(String(r.students_count), colX[1], y);
                 doc.text(String(r.faculty_required), colX[2], y);
-                doc.text(r.faculty_name || '— unassigned —', colX[3], y);
+                doc.text(r.faculty_name || 'â€” unassigned â€”', colX[3], y);
                 doc.text(r.designation ? r.designation.replace('_', ' ') : '', colX[4], y);
                 doc.moveDown();
             }
@@ -92,4 +92,85 @@ function generateDutyChartPdf(examSessionId) {
     });
 }
 
-module.exports = { generateDutyChartExcel, generateDutyChartPdf };
+// ─── Session-level (room-free) export ────────────────────────────────────────
+
+async function getSessionDutyData(sessionIds) {
+    const { rows: sessions } = await db.query(
+        `SELECT id, exam_name, exam_date, session, year_sem
+         FROM exam_sessions WHERE id = ANY($1::int[]) ORDER BY session`,
+        [sessionIds]
+    );
+    const { rows: duties } = await db.query(
+        `SELECT sd.exam_session_id, es.session, es.exam_name, es.exam_date,
+                f.name AS faculty_name, f.designation, f.priority, sd.status
+         FROM session_duty sd
+         JOIN exam_sessions es ON es.id = sd.exam_session_id
+         JOIN faculty f ON f.id = sd.faculty_id
+         WHERE sd.exam_session_id = ANY($1::int[])
+         ORDER BY es.session, f.priority, f.name`,
+        [sessionIds]
+    );
+    return { sessions, duties };
+}
+
+async function generateSessionDutyChartExcel(sessionIds) {
+    const { sessions, duties } = await getSessionDutyData(sessionIds);
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet('Duty Chart');
+
+    const title = sessions.map(s => `${s.exam_name} ${String(s.exam_date).slice(0,10)} (${s.session})`).join(' + ');
+    sheet.mergeCells('A1:E1');
+    sheet.getCell('A1').value = title;
+    sheet.getCell('A1').font = { bold: true, size: 14 };
+    sheet.addRow([]);
+
+    const hr = sheet.addRow(['Session', 'S.No', 'Invigilator', 'Designation', 'Status']);
+    hr.font = { bold: true };
+    hr.eachCell(c => {
+        c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1e293b' } };
+        c.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    });
+
+    let sno = 1;
+    for (const d of duties) {
+        sheet.addRow([
+            d.session,
+            sno++,
+            d.faculty_name,
+            d.designation ? d.designation.replace(/_/g, ' ') : '',
+            d.status,
+        ]);
+    }
+    sheet.columns.forEach(c => { c.width = 24; });
+    return workbook.xlsx.writeBuffer();
+}
+
+async function generateSessionDutyChartPdf(sessionIds) {
+    const { sessions, duties } = await getSessionDutyData(sessionIds);
+    return new Promise((resolve, reject) => {
+        const doc    = new PDFDocument({ margin: 40 });
+        const chunks = [];
+        doc.on('data', c => chunks.push(c));
+        doc.on('end', () => resolve(Buffer.concat(chunks)));
+        doc.on('error', reject);
+
+        const title = sessions.map(s => `${s.exam_name} — ${String(s.exam_date).slice(0,10)} (${s.session})`).join(' + ');
+        doc.fontSize(14).font('Helvetica-Bold').text(title, { align: 'center' });
+        doc.moveDown();
+
+        let sno = 1;
+        for (const d of duties) {
+            doc.fontSize(11).font('Helvetica')
+               .text(`${d.session}  |  ${sno++}. ${d.faculty_name}  (${d.designation ? d.designation.replace(/_/g,' ') : ''})  — ${d.status}`);
+        }
+        doc.end();
+    });
+}
+
+module.exports = {
+    generateDutyChartExcel,
+    generateDutyChartPdf,
+    generateSessionDutyChartExcel,
+    generateSessionDutyChartPdf,
+};
+

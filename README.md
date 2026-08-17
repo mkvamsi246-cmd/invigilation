@@ -1,4 +1,4 @@
-# Automatic Invigilation Duty Allocation System
+# Smart Invigilation System
 
 Generates exam invigilation duty charts automatically based on:
 - **Faculty type** (Professor / Associate Professor / Assistant Professor) and a configurable **priority order** between them
@@ -8,6 +8,23 @@ Generates exam invigilation duty charts automatically based on:
 - **Classroom capacity** — 1 invigilator per 24 students (configurable) per room
 
 Data can be entered by hand in the UI, or bulk-imported from Excel (recommended) or PDF. Generated duty charts can be edited (reassign or cancel individual duties) and re-generated at any time, and exported as Excel or PDF.
+
+---
+
+## Department Login Credentials
+
+The system provides multi-tenant data isolation per department. Every login has its own private workspace (faculty, weekly timetables, exam sessions, and duty sheets).
+
+| Department | Username | Initial Password |
+| :--- | :--- | :--- |
+| **Mechanical Engineering** | `mech-srkr` | `mech@123` |
+| **Computer Science & Engineering** | `CSE-srkr` | `cse@123` |
+| **Civil Engineering** | `civil-srkr` | `civil@123` |
+| **Electrical & Electronics Engineering** | `eee-srkr` | `eee@123` |
+| **Electronics & Communication Engineering** | `ece-srkr` | `ece@123` |
+| **Information Technology** | `it-srkr` | `it@123` |
+
+*Note: You can change your password anytime in **Settings → Change Account Password**.*
 
 ---
 

@@ -14,6 +14,8 @@ const examRoutes = require('./routes/exams');
 const allocationRoutes = require('./routes/allocation');
 const uploadRoutes = require('./routes/upload');
 const templateRoutes = require('./routes/templates');
+const dutySheetRoutes = require('./routes/dutysheet');
+const settingsRoutes = require('./routes/settings');
 
 const app = express();
 
@@ -56,6 +58,8 @@ app.use('/api/exams', examRoutes);
 app.use('/api/allocation', allocationRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/templates', templateRoutes);
+app.use('/api/duty-sheet', dutySheetRoutes);
+app.use('/api/settings', settingsRoutes);
 
 // Serve the frontend (single static folder, deployed alongside backend)
 const frontendPath = path.join(__dirname, '..', '..', 'frontend');

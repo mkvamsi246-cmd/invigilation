@@ -39,55 +39,77 @@ router.post('/:importType', upload.single('file'), async (req, res) => {
     try {
         if (importType === 'faculty') {
             for (const r of records) {
-                const existing = await db.query(
-                    `SELECT id FROM faculty WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))`,
-                    [r.name]
-                );
-                if (existing.rows.length > 0) {
-                    await db.query(
-                        `UPDATE faculty SET
-                            designation = $1,
-                            department  = COALESCE($2, department),
-                            email       = COALESCE($3, email),
-                            phone       = COALESCE($4, phone),
-                            duty_count  = $5,
-                            priority    = $6,
-                            updated_at  = now()
-                         WHERE id = $7`,
-                        [r.designation, r.department, r.email, r.phone, r.duty_count, r.priority, existing.rows[0].id]
+                if (r.sno !== null && r.sno !== undefined) {
+                    const existing = await db.query(
+                        `SELECT id FROM faculty WHERE serial_no = $1 AND user_id = $2`,
+                        [r.sno, req.userId]
                     );
+                    const contactVal = r.contact || null;
+                    const roomNoVal  = r.roomNo || null;
+                    if (existing.rows.length > 0) {
+                        await db.query(
+                            `UPDATE faculty SET
+                                name        = $1,
+                                designation = $2,
+                                department  = COALESCE($3, department),
+                                shortcuts   = $4,
+                                email       = COALESCE($5, email),
+                                contact     = COALESCE($6, contact),
+                                room_no     = COALESCE($7, room_no),
+                                updated_at  = now()
+                             WHERE id = $8 AND user_id = $9`,
+                            [r.name, r.designation, r.department, r.shortcuts, r.email, contactVal, roomNoVal, existing.rows[0].id, req.userId]
+                        );
+                    } else {
+                        await db.query(
+                            `INSERT INTO faculty (user_id, serial_no, name, designation, department, shortcuts, email, contact, room_no)
+                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+                            [req.userId, r.sno, r.name, r.designation, r.department, r.shortcuts, r.email, contactVal, roomNoVal]
+                        );
+                    }
                 } else {
                     await db.query(
-                        `INSERT INTO faculty (name, designation, department, email, phone, duty_count, priority)
-                         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-                        [r.name, r.designation, r.department, r.email, r.phone, r.duty_count || 0, r.priority]
+                        `INSERT INTO faculty (user_id, name, designation, department, shortcuts, email, phone)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7)
+                         ON CONFLICT DO NOTHING`,
+                        [req.userId, r.name, r.designation, r.department, r.shortcuts, r.email, r.phone]
                     );
                 }
                 imported++;
             }
         } else if (importType === 'classrooms') {
             for (const r of records) {
-                await db.query(
-                    `INSERT INTO classrooms (room_no, building, capacity)
-                     VALUES ($1, $2, $3)
-                     ON CONFLICT (room_no) DO UPDATE SET capacity = EXCLUDED.capacity, building = EXCLUDED.building`,
-                    [r.roomNo, r.building, r.capacity]
-                );
+                const existing = await db.query('SELECT id FROM classrooms WHERE room_no = $1 AND user_id = $2', [r.roomNo, req.userId]);
+                if (existing.rows.length > 0) {
+                    await db.query(
+                        `UPDATE classrooms SET capacity = $1, building = COALESCE($2, building), updated_at = now() WHERE id = $3 AND user_id = $4`,
+                        [r.capacity, r.building, existing.rows[0].id, req.userId]
+                    );
+                } else {
+                    await db.query(
+                        `INSERT INTO classrooms (user_id, room_no, building, capacity) VALUES ($1, $2, $3, $4)`,
+                        [req.userId, r.roomNo, r.building, r.capacity]
+                    );
+                }
                 imported++;
             }
         } else if (importType === 'exam_rooms') {
             for (const r of records) {
                 const sessionRes = await db.query(
-                    `INSERT INTO exam_sessions (exam_name, exam_date, session)
-                     VALUES ($1, $2, $3)
-                     ON CONFLICT (exam_name, exam_date, session) DO UPDATE SET exam_name = EXCLUDED.exam_name
+                    `INSERT INTO exam_sessions
+                         (user_id, exam_name, exam_date, session, year_sem, required_invigilators)
+                     VALUES ($1, $2, $3, $4, $5, $6)
+                     ON CONFLICT (exam_name, exam_date, session) DO UPDATE SET
+                         exam_name             = EXCLUDED.exam_name,
+                         year_sem              = COALESCE(EXCLUDED.year_sem, exam_sessions.year_sem),
+                         required_invigilators = COALESCE(EXCLUDED.required_invigilators, exam_sessions.required_invigilators)
                      RETURNING id`,
-                    [r.examName, r.date, r.session]
+                    [req.userId, r.examName, r.date, r.session, r.yearSem || null, r.requiredInvigilators || null]
                 );
                 const examSessionId = sessionRes.rows[0].id;
 
-                const classroomRes = await db.query('SELECT id FROM classrooms WHERE room_no = $1', [r.roomNo]);
-                if (classroomRes.rows.length === 0) { continue; } // room not registered yet
+                const classroomRes = await db.query('SELECT id FROM classrooms WHERE room_no = $1 AND user_id = $2', [r.roomNo, req.userId]);
+                if (classroomRes.rows.length === 0) { continue; }
                 const classroomId = classroomRes.rows[0].id;
                 const facultyRequired = Math.max(1, Math.ceil(r.studentsCount / 24));
 
@@ -100,23 +122,51 @@ router.post('/:importType', upload.single('file'), async (req, res) => {
                 );
                 imported++;
             }
+            const sessionConflicts = parsed.sessionConflicts || 0;
+            if (sessionConflicts > 0) {
+                return res.json({
+                    imported, skipped, total: records.length,
+                    warning: `${sessionConflicts} rows had conflicting year_sem or required_invigilators values for the same exam session — first-row values were used.`,
+                });
+            }
+        } else if (importType === 'exam_sessions') {
+            for (const r of records) {
+                const existing = await db.query(
+                    'SELECT id FROM exam_sessions WHERE exam_name = $1 AND exam_date = $2 AND session = $3 AND user_id = $4',
+                    [r.examName, r.date, r.session, req.userId]
+                );
+                if (existing.rows.length > 0) {
+                    await db.query(
+                        `UPDATE exam_sessions SET
+                            year_sem = COALESCE($1, year_sem),
+                            required_invigilators = COALESCE($2, required_invigilators),
+                            start_time = COALESCE($3, start_time),
+                            end_time = COALESCE($4, end_time)
+                         WHERE id = $5 AND user_id = $6`,
+                        [r.yearSem || null, r.requiredInvigilators || null, r.startTime || null, r.endTime || null, existing.rows[0].id, req.userId]
+                    );
+                } else {
+                    await db.query(
+                        `INSERT INTO exam_sessions
+                             (user_id, exam_name, exam_date, session, year_sem, required_invigilators, start_time, end_time)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+                        [req.userId, r.examName, r.date, r.session, r.yearSem || null, r.requiredInvigilators || null, r.startTime || null, r.endTime || null]
+                    );
+                }
+                imported++;
+            }
         } else if (importType === 'workload') {
             for (const r of records) {
                 await db.query(
-                    `UPDATE faculty SET duty_count = $1 WHERE name = $2`,
-                    [r.workloadTotal, r.name]
+                    `UPDATE faculty SET duty_count = $1 WHERE name = $2 AND user_id = $3`,
+                    [r.workloadTotal, r.name, req.userId]
                 );
                 imported++;
             }
         } else if (importType === 'timetable') {
-            // Match by name (case-insensitive) against existing faculty; unmatched names are skipped
-            // so the timetable import doesn't silently create phantom faculty records.
-            const facultyRes = await db.query('SELECT id, name FROM faculty');
+            const facultyRes = await db.query('SELECT id, name FROM faculty WHERE user_id = $1', [req.userId]);
             const nameToId = new Map(facultyRes.rows.map((f) => [f.name.trim().toLowerCase(), f.id]));
 
-            // Re-uploading should fully replace each matched faculty member's timetable
-            // (not just upsert individual periods), so periods that became free show up
-            // as free rather than keeping a stale "busy" entry from the old timetable.
             const matchedFacultyIds = new Set();
             for (const r of records) {
                 const facultyId = nameToId.get(r.facultyName.trim().toLowerCase());
@@ -131,18 +181,18 @@ router.post('/:importType', upload.single('file'), async (req, res) => {
                 const facultyId = nameToId.get(r.facultyName.trim().toLowerCase());
                 if (!facultyId) { unmatchedNames++; continue; }
                 await db.query(
-                    `INSERT INTO faculty_timetable (faculty_id, day_of_week, period, subject_code)
-                     VALUES ($1, $2, $3, $4)
+                    `INSERT INTO faculty_timetable (faculty_id, day_of_week, period, subject_code, year_sem)
+                     VALUES ($1, $2, $3, $4, $5)
                      ON CONFLICT (faculty_id, day_of_week, period)
-                     DO UPDATE SET subject_code = EXCLUDED.subject_code`,
-                    [facultyId, r.dayOfWeek, r.period, r.subjectCode]
+                     DO UPDATE SET subject_code = EXCLUDED.subject_code, year_sem = EXCLUDED.year_sem`,
+                    [facultyId, r.dayOfWeek, r.period, r.subjectCode, r.yearSem || null]
                 );
                 imported++;
             }
             if (unmatchedNames > 0) {
                 return res.json({
                     imported, skipped: skipped + unmatchedNames, total: records.length,
-                    warning: `${unmatchedNames} timetable entries didn't match any existing faculty name — import Faculty first, then re-upload the timetable.`,
+                    warning: `${unmatchedNames} timetable entries didn't match any existing faculty name â€” import Faculty first, then re-upload the timetable.`,
                 });
             }
         } else {
@@ -162,3 +212,4 @@ router.post('/:importType', upload.single('file'), async (req, res) => {
 });
 
 module.exports = router;
+

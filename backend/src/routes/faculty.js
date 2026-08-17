@@ -8,7 +8,7 @@ router.use(requireAuth);
 // List all faculty
 router.get('/', async (req, res) => {
     try {
-        const { rows } = await db.query('SELECT * FROM faculty ORDER BY name');
+        const { rows } = await db.query('SELECT * FROM faculty WHERE user_id = $1 ORDER BY serial_no DESC NULLS LAST, name', [req.userId]);
         res.json(rows);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -17,17 +17,16 @@ router.get('/', async (req, res) => {
 
 // Create faculty
 router.post('/', async (req, res) => {
-    const { name, designation, department, email, phone, duty_count, priority } = req.body;
+    const { name, designation, department, email, phone, contact, room_no, duty_count, serial_no, shortcuts } = req.body;
     if (!name || !designation) return res.status(400).json({ error: 'name and designation are required' });
-    // Default priority based on designation if not provided
-    const defaultPriority = designation === 'professor' ? 1 : designation === 'associate_professor' ? 2 : 3;
     try {
         const { rows } = await db.query(
-            `INSERT INTO faculty (name, designation, department, email, phone, duty_count, priority)
-             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
-            [name, designation, department || null, email || null, phone || null,
+            `INSERT INTO faculty (user_id, name, designation, department, email, phone, contact, room_no, duty_count, serial_no, shortcuts)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+            [req.userId, name, designation, department || null, email || null, phone || null, contact || phone || null, room_no || null,
              parseInt(duty_count, 10) || 0,
-             priority !== undefined && priority !== '' ? parseInt(priority, 10) : defaultPriority]
+             serial_no !== undefined && serial_no !== null && serial_no !== '' ? parseInt(serial_no, 10) || null : null,
+             shortcuts || null]
         );
         res.status(201).json(rows[0]);
     } catch (err) {
@@ -37,7 +36,8 @@ router.post('/', async (req, res) => {
 
 // Update faculty
 router.put('/:id', async (req, res) => {
-    const { name, designation, department, email, phone, is_active, duty_count, priority } = req.body;
+    const { name, designation, department, email, phone, contact, room_no, is_active, duty_count, priority, serial_no, shortcuts } = req.body;
+    const hasSerialNo = Object.prototype.hasOwnProperty.call(req.body, 'serial_no');
     try {
         const { rows } = await db.query(
             `UPDATE faculty SET
@@ -46,14 +46,21 @@ router.put('/:id', async (req, res) => {
                 department  = COALESCE($3, department),
                 email       = COALESCE($4, email),
                 phone       = COALESCE($5, phone),
-                is_active   = COALESCE($6, is_active),
-                duty_count  = COALESCE($7, duty_count),
-                priority    = COALESCE($8, priority),
+                contact     = COALESCE($6, contact),
+                room_no     = COALESCE($7, room_no),
+                is_active   = COALESCE($8, is_active),
+                duty_count  = COALESCE($9, duty_count),
+                priority    = COALESCE($10, priority),
+                serial_no   = CASE WHEN $11 THEN $12 ELSE serial_no END,
+                shortcuts   = COALESCE($13, shortcuts),
                 updated_at  = now()
-             WHERE id = $9 RETURNING *`,
-            [name, designation, department, email, phone, is_active, duty_count,
+             WHERE id = $14 AND user_id = $15 RETURNING *`,
+            [name, designation, department, email, phone, contact, room_no, is_active, duty_count,
              priority !== undefined ? parseInt(priority, 10) : null,
-             req.params.id]
+             hasSerialNo,
+             hasSerialNo ? (serial_no !== null && serial_no !== '' ? parseInt(serial_no, 10) : null) : null,
+             shortcuts !== undefined ? (shortcuts || null) : null,
+             req.params.id, req.userId]
         );
         if (rows.length === 0) return res.status(404).json({ error: 'Faculty not found' });
         res.json(rows[0]);
@@ -65,10 +72,9 @@ router.put('/:id', async (req, res) => {
 // Delete faculty
 router.delete('/:id', async (req, res) => {
     try {
-        await db.query('DELETE FROM faculty WHERE id = $1', [req.params.id]);
+        await db.query('DELETE FROM faculty WHERE id = $1 AND user_id = $2', [req.params.id, req.userId]);
         res.json({ success: true });
     } catch (err) {
-        // Foreign key violation — faculty has assigned duties
         if (err.code === '23503') {
             return res.status(409).json({
                 error: 'Cannot delete: this faculty member has invigilation duties assigned. Cancel their duties first, then delete.'
